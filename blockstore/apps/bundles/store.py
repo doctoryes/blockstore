@@ -12,6 +12,7 @@ SnapshotRepo is unaware of DraftRepo.
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List
 from uuid import UUID
 import codecs
 import hashlib
@@ -73,6 +74,154 @@ class FileInfo:
 
 
 @attr.s(frozen=True)
+class Dependency:
+    """
+    A Dependency is a pointer to exactly one Bundle + Version + Snapshot.
+    """
+    bundle_uuid = attr.ib()
+    version = attr.ib(type=int)
+    snapshot_digest = attr.ib(type=bytes)
+
+    @classmethod
+    def from_json_dict(cls, json_dict):
+        return cls(
+            bundle_uuid=UUID(json_dict["bundle_uuid"]),
+            version=json_dict["version"],
+            snapshot_digest=bytes_from_hex_str(json_dict["snapshot_digest"]),
+        )
+
+
+@attr.s(frozen=True)
+class Link:
+    """
+    A Link is a named Dependency + all of its transitive dependencies.
+
+    Links are named because it's totally fine to have Links that point to
+    different versions of a Bundle (e.g Bundle Av1, Bundle Av2), but we want
+    some stable way of identifying and differentiating between those references.
+
+    The indirect dependencies are a flat list. We don't try to keep track of all
+    the nested dependency relations. Instead, we want the Link to answer the
+    question of "If I wanted to download this entire Bundle and all the things
+    it links to, what is the complete list of other BundleVersions that I have
+    to download to get all the dependencies?
+    """
+    name = attr.ib(type=str)
+    direct_dependency = attr.ib(type=Dependency)
+    indirect_dependencies = attr.ib(type=list)
+
+
+class LinkCollection:
+    """
+    This data structure has to hold all dependencies for a Bundle.
+
+    Like most classes in this module, `LinkCollection` is immutable. Calling
+    `with_updated_link()` and passing in a new `Link` will return a new
+    `LinkCollection` rather than modifying the object in place.
+
+    There are a few critical query patterns that we have to support here:
+
+    1. Quickly return the entire set of things that needs to be downloaded. This
+    is useful when we want to do an export of some sort.
+
+    2. Determine if there is a dependency cycle. Dependency cycles break our
+    assumptions and will lead us to endlessly prompt for updates, so we have to
+    prevent them from happening.
+
+    3. Add a new dependency (and all of its transitive dependencies).
+    """
+    def __init__(self, bundle_uuid: UUID, links: List[Link]):
+        """
+        Initialize with a `bundle_uuid` and list of Link objects.
+
+        Will raise a ValueError if the data is malformed in some way (duplicate
+        Link names or dependency cycles).
+        """
+        self._check_for_duplicates(links)
+        self._check_for_cycles(bundle_uuid, links)
+
+        self.bundle_uuid = bundle_uuid
+        self.names_to_links = {link.name: link for link in links}
+
+    def __eq__(self, other):
+        return (
+            self.bundle_uuid == other.bundle_uuid and
+            self.names_to_links == other.names_to_links
+        )
+
+    def __getitem__(self, name):
+        return self.names_to_links[name]
+
+    def __iter__(self):
+        return iter(self.names_to_links.values())
+
+    def __bool__(self):
+        return bool(self.names_to_links)
+
+    @classmethod
+    def from_json_dict(cls, bundle_uuid, json_dict):
+        def _parse_dep(dep_info):
+            return Dependency(
+                bundle_uuid=dep_info['bundle_uuid'],
+                version=dep_info['version'],
+                snapshot_digest=bytes_from_hex_str(dep_info['snapshot_digest'])
+            )
+
+        links = []
+        for link_name, link_info in json_dict.items():
+            direct_dep = _parse_dep(link_info['direct'])
+            indirect_deps = [_parse_dep(dep_info) for dep_info in link_info['indirect']]
+            links.append(
+                Link(link_name, direct_dep, indirect_deps)
+            )
+
+        print(links)
+
+        return LinkCollection(bundle_uuid, links)
+
+    def get_direct_dep(self, name, default=None):
+        link = self.names_to_links.get(name)
+        if link:
+            return link.direct_dependency
+        return None
+
+    def _check_for_duplicates(self, links):
+        seen_names = set()
+        for link in links:
+            if link.name in seen_names:
+                raise ValueError(f"Duplicate link name not allowed: {link.name}")
+
+    def _check_for_cycles(self, bundle_uuid, links):
+        for link in links:
+            if link.direct_dependency == bundle_uuid:
+                raise ValueError(
+                    f"A Bundle cannot have any version of itself as a dependency (see Link {link.name})."
+                )
+            for dep in link.indirect_dependencies:
+                if dep.bundle_uuid == bundle_uuid:
+                    raise ValueError(
+                        f"Cycle detected: Link {link.name} requires Bundle {bundle_uuid}"
+                    )
+
+    def all_dependencies(self):
+        dependencies = set(link.direct_dependency for link in self)
+        for link in self:
+            dependencies |= set(link.indirect_dependencies)
+        return list(sorted(dependencies))
+
+    def with_updated_link(self, link):
+        new_links = list(lk for lk in self if lk.name != link.name) + [link]
+        return LinkCollection(self.bundle_uuid, new_links)
+
+    def with_updated_links(self, links):
+        """Return a new LinkCollection combining self with overrides from links."""
+        names_to_links = {link.name: link for link in self}
+        for link in links:
+            names_to_links[link.name] = link
+        return LinkCollection(self.bundle_uuid, names_to_links.values())
+
+
+@attr.s(frozen=True)
 class Snapshot:
     """
     Represents an immutable, point-in-time representation of a file tree.
@@ -93,6 +242,9 @@ class Snapshot:
     # Map of paths to FileInfo objects
     files = attr.ib(type=dict)
 
+    # Captures our direct and indirect dependencies.
+    links = attr.ib(type=LinkCollection)
+
     # 20-byte BLAKE2 hash
     hash_digest = attr.ib(type=bytes)
 
@@ -100,11 +252,14 @@ class Snapshot:
     created_at = attr.ib(type=datetime)
 
     @classmethod
-    def create(cls, bundle_uuid, files, created_at=None):
+    def create(cls, bundle_uuid, files, links=None, created_at=None):
         """Create a Snapshot."""
+        if links is None:
+            links = LinkCollection(bundle_uuid, [])
+
         created_at = created_at or datetime.now(timezone.utc)
         str_to_be_hashed = json.dumps(
-            [bundle_uuid, created_at, sorted(files.items())],
+            [bundle_uuid, created_at, sorted(files.items()), sorted(links)],
             cls=BundleDataJSONEncoder,
             indent=None,
             separators=(',', ':'),
@@ -113,6 +268,7 @@ class Snapshot:
         return cls(
             bundle_uuid=bundle_uuid,
             files=files,
+            links=links,
             hash_digest=hash_digest,
             created_at=created_at,
         )
@@ -138,6 +294,8 @@ class StagedDraft:
     files_to_overwrite = attr.ib(type=dict)
     created_at = attr.ib(type=datetime)
     updated_at = attr.ib(type=datetime)
+
+    links_to_overwrite = attr.ib(type=LinkCollection)
 
     @property
     def files(self):
@@ -168,6 +326,17 @@ class StagedDraft:
             for path, file_info in merged_files.items()
             if file_info is not None
         }
+
+    def composed_links(self):
+        """
+        Return a LinkCollection that combines overrides with the base Snapshot.
+        """
+        if not self.base_snapshot:
+            base_links = LinkCollection(self.bundle_uuid, [])
+        else:
+            base_links = self.base_snapshot.links
+
+        return base_links.with_updated_links(self.links_to_overwrite)
 
     def is_deleted(self, path):
         return (path in self.files_to_overwrite) and (self.files_to_overwrite[path] is None)
@@ -254,22 +423,30 @@ class SnapshotRepo:
                 f"Snapshot {snapshot_digest.hex()} for Bundle {bundle_uuid} not found"
             )
 
+        print(snapshot_json['links'])
+
         return Snapshot(
             bundle_uuid=bundle_uuid,
             files=FileInfo.from_json_dict(snapshot_json['files']),
+            links=LinkCollection.from_json_dict(
+                bundle_uuid, snapshot_json.get('links', {})
+            ),
             hash_digest=bytes_from_hex_str(snapshot_json['hash_digest']),
             created_at=parse_utc_iso8601_datetime(snapshot_json['created_at']),
         )
 
-    def create(self, bundle_uuid, paths_to_files):
+    def create(self, bundle_uuid, paths_to_files, links=None):
         """
         Save the files, create a Snapshot object and save its JSON serialization to storage.
         """
-        files = {}
-        for path, file in paths_to_files.items():
-            files[str(path)] = self._save_file(bundle_uuid, path, file)
+        if links is None:
+            links = LinkCollection(bundle_uuid, [])
 
-        return self._create(bundle_uuid, files)
+        files = {}
+        for path, file_obj in paths_to_files.items():
+            files[str(path)] = self._save_file(bundle_uuid, path, file_obj)
+
+        return self._create(bundle_uuid, files, links)
 
     def url(self, snapshot, path):
         """Return a user-accessible URL to download a path from this Snapshot."""
@@ -302,11 +479,13 @@ class SnapshotRepo:
             path=path, public=public, size=data.size, hash_digest=file_hash.digest()
         )
 
-    def _create(self, bundle_uuid, files):
+    def _create(self, bundle_uuid, files, links):
         """
         Create a Snapshot object and save its JSON serialization to storage.
         """
-        snapshot = Snapshot.create(bundle_uuid=bundle_uuid, files=files)
+        print(f"LINKS! {links.names_to_links}")
+
+        snapshot = Snapshot.create(bundle_uuid=bundle_uuid, files=files, links=links)
         summary_json_str = json.dumps(snapshot, cls=BundleDataJSONEncoder, indent=2, sort_keys=True)
         summary_path = self._summary_path(bundle_uuid, snapshot.hash_digest)
 
@@ -386,12 +565,34 @@ class DraftRepo:
             base_snapshot_digest = bytes_from_hex_str(draft_summary_json['base_snapshot'])
             base_snapshot = self.snapshot_repo.get(bundle_uuid, base_snapshot_digest)
 
+        # Assemble the LinkCollection information from the Draft Summary JSON
+        links_to_overwrite = LinkCollection(
+            bundle_uuid,
+            [
+                Link(
+                    name=name,
+                    direct_dependency=Dependency.from_json_dict(
+                        link_info["direct"]
+                    ),
+                    indirect_dependencies=[
+                        Dependency.from_json_dict(indirect_dep_info)
+                        for indirect_dep_info in link_info["indirect"]
+                    ]
+                )
+                for name, link_info
+                in draft_summary_json.get("links_to_overwrite", {}).items()
+            ]
+        )
+
         return StagedDraft(
             uuid=UUID(draft_summary_json['uuid']),
             bundle_uuid=bundle_uuid,
             name=draft_summary_json['name'],
             base_snapshot=base_snapshot,
-            files_to_overwrite=FileInfo.from_json_dict(draft_summary_json['files_to_overwrite']),
+            files_to_overwrite=FileInfo.from_json_dict(
+                draft_summary_json['files_to_overwrite']
+            ),
+            links_to_overwrite=links_to_overwrite,
             created_at=parse_utc_iso8601_datetime(draft_summary_json['created_at']),
             updated_at=parse_utc_iso8601_datetime(draft_summary_json['updated_at']),
         )
@@ -406,6 +607,7 @@ class DraftRepo:
             name=name,
             base_snapshot=base_snapshot,
             files_to_overwrite={},
+            links_to_overwrite=LinkCollection(bundle_uuid, []),
             created_at=created_at,
             updated_at=created_at,
         )
@@ -451,7 +653,11 @@ class DraftRepo:
         If `paths` is provided, we will commit only those files.
         """
         with self.file_mapping(draft, paths) as draft_files:
-            new_snapshot = self.snapshot_repo.create(draft.bundle_uuid, draft_files)
+            new_snapshot = self.snapshot_repo.create(
+                draft.bundle_uuid,
+                draft_files,
+                draft.composed_links(),
+            )
 
         # Update the Draft to reflect the committed changes, keeping in mind
         # that we might have only committed a subset of files.
@@ -465,6 +671,7 @@ class DraftRepo:
             for path, file_info in draft.files_to_overwrite.items()
             if file_info != new_snapshot.files.get(path)
         }
+
         updated_draft = attr.evolve(
             draft,
             base_snapshot=new_snapshot,
@@ -515,19 +722,70 @@ class DraftRepo:
             for open_file in paths_to_files.values():
                 open_file.close()
 
-    def update_files(self, draft_uuid: UUID, updated_files: dict, updated_at=None) -> StagedDraft:
+    def update(self, draft_uuid, files, dependencies=None, updated_at=None) -> StagedDraft:
         """
-        Update the draft with some number of files.
+        Update the draft.
 
-        `updated_files` is a dict with paths for keys and Files for values.
+        `files` is a dict with paths for keys and Files for values.
+
+        `dependencies` is a mapping of Link names to direct Dependencies. A full
+        Link is name + direct dependencies + indirect dependencies. So we have
+        to verify that the requested direct dependency actually exists and then
+        retrieve the indirect dependencies.
+
+        This method has to figure out what the indirect dependencies are.
         """
+        if dependencies is None:
+            dependencies = {}
+
+        existing_draft = self.get(draft_uuid)
+        new_files = self._new_files_for_update(existing_draft, files)
+        new_links_col = self._new_links_for_update(existing_draft, dependencies)
+
+        new_draft = attr.evolve(
+            existing_draft,
+            files_to_overwrite={**existing_draft.files_to_overwrite, **new_files},
+            links_to_overwrite=new_links_col,
+            updated_at=updated_at or datetime.now(timezone.utc)
+        )
+
+        self._save_summary_file(new_draft)
+
+        return new_draft
+
+    def _new_links_for_update(self, existing_draft, dependencies):
+        # First, let's only find the dependencies we actually need to update...
+        dependency_updates = {
+            name: dep
+            for name, dep in dependencies.items()
+            if dep != existing_draft.links_to_overwrite.get_direct_dep(name)
+        }
+
+        # Now we find the indirect dependencies for all of these
+        new_links = []
+        for name, dep in dependency_updates.items():
+            indirects = [] if dep is None else self._get_indirects(dep)
+            if dep is not None:
+                new_links.append(Link(name, dep, indirects))
+
+        return LinkCollection(existing_draft.bundle_uuid, new_links)
+
+    def _get_indirects(self, dep):
+        """
+        Given a direct dependency, find and return all indirect dependencies.
+
+        This requires accessing the Snapshot for the dependency.
+        """
+        dep_snapshot = self.snapshot_repo.get(dep.bundle_uuid, dep.snapshot_digest)
+        return dep_snapshot.links.all_dependencies()
+
+    def _new_files_for_update(self, existing_draft, files):
         # First write all the files out in their appropriate draft space.
         new_files_written = {}
-        existing_draft = self.get(draft_uuid)
-        for path, django_file in updated_files.items():
+        for path, django_file in files.items():
             if not is_safe_file_path(path):
                 raise DraftRepo.SaveError(f'"{path}" is not a valid file name')
-            storage_path = self._data_file_path(draft_uuid, path)
+            storage_path = self._data_file_path(existing_draft.uuid, path)
 
             # If the django_file is None, it means we want a delete
             if django_file is None:
@@ -544,15 +802,7 @@ class DraftRepo:
                 self._overwrite(storage_path, django_file)
 
             new_files_written[path] = file_info
-
-        new_draft = attr.evolve(
-            existing_draft,
-            files_to_overwrite={**existing_draft.files_to_overwrite, **new_files_written},
-            updated_at=updated_at or datetime.now(timezone.utc)
-        )
-        self._save_summary_file(new_draft)
-
-        return new_draft
+        return new_files_written
 
     def url(self, draft, path):
         """Return URL of Draft file, fallback to Snapshot if unmodified."""
@@ -580,6 +830,7 @@ class BundleDataJSONEncoder(json.JSONEncoder):
                 'bundle_uuid': o.bundle_uuid,
                 'hash_digest': o.hash_digest.hex(),
                 'files': o.files,
+                'links': o.links,
                 'created_at': o.created_at,
                 '_type': 'snapshot',
                 '_version': 1,
@@ -595,11 +846,34 @@ class BundleDataJSONEncoder(json.JSONEncoder):
                 'name': o.name,
                 'base_snapshot': base_snapshot,
                 'files_to_overwrite': o.files_to_overwrite,
+                'links_to_overwrite': o.links_to_overwrite,
                 'created_at': o.created_at,
                 'updated_at': o.updated_at,
                 '_type': 'draft',
                 '_version': 1,
             }
+        elif isinstance(o, LinkCollection):
+            return {
+                link.name: {
+                    "direct": link.direct_dependency,
+                    "indirect": link.indirect_dependencies
+                }
+                for link in o
+            }
+        # Links are rarely serialized outside a LinkCollection
+        elif isinstance(o, Link):
+            return {
+                "name": o.name,
+                "direct": o.direct_dependency,
+                "indirect": o.indirect_dependencies,
+            }
+        elif isinstance(o, Dependency):
+            return {
+                "bundle_uuid": o.bundle_uuid,
+                "version": o.version,
+                "snapshot_digest": o.snapshot_digest.hex(),
+            }
+
         return json.JSONEncoder.default(self, o)
 
 

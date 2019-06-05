@@ -120,10 +120,11 @@ class DraftViewSet(viewsets.ModelViewSet):
         """
         serializer = DraftFileUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        files_to_write = serializer.validated_data
+        files_to_write = serializer.validated_data['files']
+        dependencies_to_write = serializer.validated_data['links']
 
         draft_repo = DraftRepo(SnapshotRepo())
-        draft_repo.update_files(uuid, files_to_write)
+        draft_repo.update(uuid, files_to_write, dependencies_to_write)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -148,7 +149,7 @@ class DraftViewSet(viewsets.ModelViewSet):
 
         # Is this the appropriate response when trying to commit a Draft with
         # no changes?
-        if not staged_draft.files_to_overwrite:
+        if not staged_draft.files_to_overwrite and not staged_draft.links_to_overwrite:
             raise serializers.ValidationError("Draft has no changes to commit.")
 
         new_snapshot, _updated_draft = draft_repo.commit(staged_draft)
